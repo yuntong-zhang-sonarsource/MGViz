@@ -59,10 +59,36 @@ router.get("/queryTilesetTimes", function (req, res, next) {
     return;
   }
 
+  // Helper function to validate the user-supplied path
+  function isSafePath(base, target) {
+    // Resolve the absolute path
+    const resolvedPath = path.resolve(base, target);
+    // Ensure the resolved path starts with the base directory
+    if (!resolvedPath.startsWith(path.resolve(base))) {
+      return false;
+    }
+    // Prevent absolute paths and directory traversal
+    if (target.includes("..") || path.isAbsolute(target)) {
+      return false;
+    }
+    return true;
+  }
+
   const relUrl = originalUrl.replace("/Missions", "");
   if (originalUrl.indexOf("_time_") > -1) {
     const urlSplit = originalUrl.split("_time_");
     const relUrlSplit = relUrl.split("_time_");
+
+    // Validate the user-supplied path before using it
+    const missionsDir = path.join(rootDir, "Missions");
+    const userPath = urlSplit[0].replace(/^\/Missions/, ""); // Remove leading /Missions if present
+    if (!isSafePath(missionsDir, userPath)) {
+      res.send({
+        status: "failure",
+        message: "Invalid path: directory traversal or absolute paths are not allowed.",
+      });
+      return;
+    }
 
     if (dirStore[relUrlSplit[0]] == null) {
       dirStore[relUrlSplit[0]] = {

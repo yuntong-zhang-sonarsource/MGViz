@@ -50,10 +50,24 @@ function get(reqtype, req, res, next) {
     .then((result) => {
       if (result) {
         let table = result.dataValues.table;
+
+        // Validate table name: only allow alphanumeric and underscores, must end with _geodatasets
+        if (
+          typeof table !== "string" ||
+          !/^[a-zA-Z0-9_]+$/.test(table) ||
+          !table.endsWith("_geodatasets")
+        ) {
+          res.send({
+            status: "failure",
+            message: "Invalid table name.",
+          });
+          return null;
+        }
+
         if (type == "geojson") {
           sequelize
             .query(
-              "SELECT properties, ST_AsGeoJSON(geom)" + " " + "FROM " + table
+              `SELECT properties, ST_AsGeoJSON(geom) FROM "${table}"`
             )
             .then(([results]) => {
               let geojson = { type: "FeatureCollection", features: [] };
@@ -103,55 +117,40 @@ function get(reqtype, req, res, next) {
           let ne2 = { lat: ne.lat + oLat, lng: ne.lng + oLng };
           let sw2 = { lat: sw.lat - oLat, lng: sw.lng - oLng };
 
+          // Use parameterized query for all user-supplied values except table name (which is validated)
+          const mvtSql = `
+            SELECT ST_AsMVT(q, :layer, 4096, 'geommvt')
+            FROM (
+              SELECT
+                id,
+                properties,
+                ST_AsMvtGeom(
+                  geom,
+                  ST_MakeEnvelope(:swLng, :swLat, :neLng, :neLat, 4326),
+                  4096,
+                  256,
+                  true
+                ) AS geommvt
+              FROM "${table}"
+              WHERE geom && ST_MakeEnvelope(:sw2Lng, :sw2Lat, :ne2Lng, :ne2Lat, 4326)
+                AND ST_Intersects(geom, ST_MakeEnvelope(:sw2Lng, :sw2Lat, :ne2Lng, :ne2Lat, 4326))
+            ) AS q;
+          `;
+
           sequelize
             .query(
-              "SELECT ST_AsMVT(q, '" +
-                layer +
-                "', 4096, 'geommvt') " +
-                "FROM (" +
-                "SELECT " +
-                "id, " +
-                "properties, " +
-                "ST_AsMvtGeom(" +
-                "geom," +
-                "ST_MakeEnvelope(" +
-                sw.lng +
-                "," +
-                sw.lat +
-                "," +
-                ne.lng +
-                "," +
-                ne.lat +
-                ", 4326)," +
-                "4096," +
-                "256," +
-                "true" +
-                ") AS geommvt " +
-                "FROM " +
-                table +
-                " " +
-                "WHERE geom && ST_MakeEnvelope(" +
-                sw2.lng +
-                "," +
-                sw2.lat +
-                "," +
-                ne2.lng +
-                "," +
-                ne2.lat +
-                ", 4326) " +
-                "AND ST_Intersects(geom, ST_MakeEnvelope(" +
-                sw2.lng +
-                "," +
-                sw2.lat +
-                "," +
-                ne2.lng +
-                "," +
-                ne2.lat +
-                ", 4326))" +
-                ") AS q;",
+              mvtSql,
               {
                 replacements: {
-                  table: table,
+                  layer: layer,
+                  swLng: sw.lng,
+                  swLat: sw.lat,
+                  neLng: ne.lng,
+                  neLat: ne.lat,
+                  sw2Lng: sw2.lng,
+                  sw2Lat: sw2.lat,
+                  ne2Lng: ne2.lng,
+                  ne2Lat: ne2.lat,
                 },
               }
             )

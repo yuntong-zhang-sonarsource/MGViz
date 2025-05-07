@@ -20,11 +20,25 @@ const makeNewDatasetTable = datasets.makeNewDatasetTable;
 router.post("/get", function (req, res, next) {
   get(req, res, next);
 });
+const { QueryTypes } = require("sequelize");
+
 function get(req, res, next) {
   const queries = JSON.parse(req.body.queries);
 
   let results = [];
   loopedGet(0);
+
+  async function getTableColumns(tableName) {
+    // Get column names for the table from information_schema
+    const columns = await sequelize.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = :tableName",
+      {
+        replacements: { tableName },
+        type: QueryTypes.SELECT,
+      }
+    );
+    return columns.map(col => col.column_name);
+  }
 
   function loopedGet(i) {
     if (i >= queries.length) {
@@ -36,28 +50,47 @@ function get(req, res, next) {
     }
     //First Find the table name
     Datasets.findOne({ where: { name: queries[i].dataset } })
-      .then((result) => {
+      .then(async (result) => {
         if (result) {
-          const column = queries[i].column
+          const tableName = result.dataValues.table;
+          // Validate table name: only allow tables from Datasets table
+          if (!tableName || typeof tableName !== "string") {
+            loopedGet(i + 1);
+            return null;
+          }
+          // Validate column name
+          let column = queries[i].column
             .replace(/[`~!@#$%^&*|+\-=?;:'",.<>\{\}\[\]\\\/]/gi, "")
             .replace(/[^ -~]+/g, "");
+          // Get allowed columns for the table
+          let allowedColumns;
+          try {
+            allowedColumns = await getTableColumns(tableName);
+          } catch (e) {
+            loopedGet(i + 1);
+            return null;
+          }
+          if (!allowedColumns.includes(column)) {
+            loopedGet(i + 1);
+            return null;
+          }
+          // Use safe identifiers for table and column
+          const safeTable = `"${tableName.replace(/"/g, "")}"`;
+          const safeColumn = `"${column.replace(/"/g, "")}"`;
           sequelize
             .query(
-              "SELECT * FROM " +
-                result.dataValues.table +
-                ' WHERE "' +
-                column +
-                '"=:search ORDER BY id ASC LIMIT 100',
+              `SELECT * FROM ${safeTable} WHERE ${safeColumn} = :search ORDER BY id ASC LIMIT 100`,
               {
                 replacements: {
                   search: queries[i].search,
                 },
+                type: QueryTypes.SELECT,
               }
             )
-            .then(([r]) => {
+            .then((r) => {
               results.push({
                 ...queries[i],
-                table: result.dataValues.table,
+                table: tableName,
                 results: r,
               });
               loopedGet(i + 1);

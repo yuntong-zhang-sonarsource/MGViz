@@ -604,7 +604,12 @@ const compile = function (req, res, callback) {
   const isTest = req.query.test === "true" || req.body.test === "true";
   let Table = isTest ? UserfilesTEST : Userfiles;
 
-  let atThisTime = req.query.time || Math.floor(Date.now());
+  // Parse and validate atThisTime as integer
+  let atThisTime = req.query.time || req.body.time || Math.floor(Date.now());
+  atThisTime = parseInt(atThisTime, 10);
+  if (isNaN(atThisTime)) {
+    atThisTime = Math.floor(Date.now());
+  }
 
   Table.findAll({
     where: {
@@ -626,22 +631,16 @@ const compile = function (req, res, callback) {
     for (let f = 0; f < files.length; f++) {
       sequelize
         .query(
-          "SELECT history" +
-            " " +
-            "FROM file_histories" +
-            (isTest ? "_tests" : "") +
-            " " +
-            "WHERE file_id=" +
-            files[f].dataValues.id +
-            " " +
-            "AND time<=" +
-            atThisTime +
-            " " +
-            "ORDER BY time DESC" +
-            " " +
-            "FETCH first 1 rows only"
+          `SELECT history FROM file_histories${isTest ? '_tests' : ''} WHERE file_id = :file_id AND time <= :atThisTime ORDER BY time DESC FETCH first 1 rows only`,
+          {
+            replacements: {
+              file_id: files[f].dataValues.id,
+              atThisTime: atThisTime,
+            },
+            type: sequelize.QueryTypes.SELECT,
+          }
         )
-        .then(([results]) => {
+        .then((results) => {
           let bestHistory = results.length > 0 ? results[0].history : [];
           featureIds = featureIds.concat(bestHistory);
           finished++;
@@ -650,83 +649,44 @@ const compile = function (req, res, callback) {
     }
     function tryProcessFeatures(finished) {
       if (finished == files.length) {
-        featureIds = featureIds.join(",") || "NULL";
-        //get all features
+        // featureIds is an array of numbers/strings
+        // If empty, use [null] to avoid SQL error
+        let featureIdsArr = featureIds.length > 0 ? featureIds : [null];
         sequelize
           .query(
-            "SELECT " +
-              "id, file_id, level, intent, properties, ST_AsGeoJSON(geom)" +
-              " " +
-              "FROM user_features" +
-              (isTest ? "_tests" : "") +
-              " " +
-              "WHERE id IN (" +
-              featureIds +
-              ")"
+            `SELECT id, file_id, level, intent, properties, ST_AsGeoJSON(geom) FROM user_features${isTest ? '_tests' : ''} WHERE id IN (:featureIds)`,
+            {
+              replacements: { featureIds: featureIdsArr },
+              type: sequelize.QueryTypes.SELECT,
+            }
           )
-          .then(([features]) => {
+          .then((features) => {
             processFeatures(features);
           });
       }
     }
     function processFeatures(features) {
+      // features is an array of objects
+      let featureIdsArr = features.map(f => f.id);
+      if (featureIdsArr.length === 0) featureIdsArr = [null];
       sequelize
         .query(
-          "SELECT" +
-            " " +
-            '\'intersects\' as "association", a.id, a.intent, b.id AS "associated_id", b.intent AS "associated_intent", b.properties AS "associated_properties"' +
-            " " +
-            "FROM user_features" +
-            (isTest ? "_tests" : "") +
-            " a," +
-            " " +
-            "user_features" +
-            (isTest ? "_tests" : "") +
-            " b" +
-            " " +
-            "WHERE a.id IN (" +
-            featureIds +
-            ")" +
-            " " +
-            "AND b.id IN (" +
-            featureIds +
-            ")" +
-            " " +
-            "AND a.id != b.id" +
-            " " +
-            "AND ((ST_OVERLAPS(ST_BUFFER(a.geom, -0.000005, 'join=mitre'), b.geom)" +
-            " " +
-            "AND NOT ST_Touches(a.geom, b.geom))" +
-            " " +
-            "OR ST_CROSSES(ST_BUFFER(a.geom, -0.000005, 'join=mitre'), b.geom))" +
-            " " +
-            "UNION ALL" +
-            " " +
-            "SELECT" +
-            " " +
-            '\'contains\' as "association", a.id, a.intent, b.id AS "associated_id", b.intent AS "associated_intent", b.properties AS "associated_properties"' +
-            " " +
-            "FROM user_features" +
-            (isTest ? "_tests" : "") +
-            " a," +
-            " " +
-            "user_features" +
-            (isTest ? "_tests" : "") +
-            " b" +
-            " " +
-            "WHERE a.id IN (" +
-            featureIds +
-            ")" +
-            " " +
-            "AND b.id IN (" +
-            featureIds +
-            ")" +
-            " " +
-            "AND a.id != b.id" +
-            " " +
-            "AND ST_Contains(a.geom, b.geom)"
+          `SELECT 'intersects' as association, a.id, a.intent, b.id AS associated_id, b.intent AS associated_intent, b.properties AS associated_properties
+           FROM user_features${isTest ? '_tests' : ''} a, user_features${isTest ? '_tests' : ''} b
+           WHERE a.id IN (:featureIds) AND b.id IN (:featureIds) AND a.id != b.id
+           AND ((ST_OVERLAPS(ST_BUFFER(a.geom, -0.000005, 'join=mitre'), b.geom) AND NOT ST_Touches(a.geom, b.geom))
+           OR ST_CROSSES(ST_BUFFER(a.geom, -0.000005, 'join=mitre'), b.geom))
+           UNION ALL
+           SELECT 'contains' as association, a.id, a.intent, b.id AS associated_id, b.intent AS associated_intent, b.properties AS associated_properties
+           FROM user_features${isTest ? '_tests' : ''} a, user_features${isTest ? '_tests' : ''} b
+           WHERE a.id IN (:featureIds) AND b.id IN (:featureIds) AND a.id != b.id
+           AND ST_Contains(a.geom, b.geom)`,
+          {
+            replacements: { featureIds: featureIdsArr },
+            type: sequelize.QueryTypes.SELECT,
+          }
         )
-        .then(([results]) => {
+        .then((results) => {
           let hierarchy = [];
           let intentOrder = ["roi", "campaign", "campsite", "signpost"];
           let excludeIntents = ["polygon", "line", "point", "text", "arrow"];

@@ -23,6 +23,26 @@ const WebSocket = require("isomorphic-ws");
 const fs = require("fs");
 const deepmerge = require("deepmerge");
 
+// Helper function to validate mission names for safe filesystem usage
+function isValidMissionName(mission) {
+  // Only allow alphanumeric, underscore, hyphen, and no path traversal or slashes
+  // No absolute paths, no '..', no '/', no '\\'
+  if (
+    typeof mission !== "string" ||
+    mission.length === 0 ||
+    mission.length > 100 ||
+    mission.includes("..") ||
+    mission.includes("/") ||
+    mission.includes("\\") ||
+    mission.startsWith(".") ||
+    mission.startsWith("/") ||
+    !/^[a-zA-Z0-9_\-]+$/.test(mission)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 let fullAccess = false;
 if (
   !process.env.hasOwnProperty("HIDE_CONFIG") ||
@@ -119,6 +139,13 @@ function add(req, res, next, cb) {
   configTemplate = req.body.config || configTemplate;
   configTemplate.msv.mission = req.body.mission;
 
+  // Validate mission name for filesystem safety
+  if (!isValidMissionName(req.body.mission)) {
+    logger("error", "Attempted to add bad mission name (filesystem unsafe).", req.originalUrl, req);
+    res.send({ status: "failure", message: "Bad mission name. Mission name must only contain letters, numbers, underscores, or hyphens, and must not contain path traversal or slashes." });
+    return;
+  }
+
   if (
     req.body.mission !==
       req.body.mission.replace(
@@ -145,93 +172,93 @@ function add(req, res, next, cb) {
       mission: req.body.mission,
     },
   })
-    .then((mission) => {
-      if (!mission) {
-        Config.create(newConfig)
-          .then((created) => {
-            if (req.body.makedir === "true") {
-              let dir = "./Missions/" + created.mission;
-              if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir);
-                let dir2 = dir + "/Layers";
-                if (!fs.existsSync(dir2)) {
-                  fs.mkdirSync(dir2);
-                }
-                let dir3 = dir + "/Data";
-                if (!fs.existsSync(dir3)) {
-                  fs.mkdirSync(dir3);
-                }
+  .then((mission) => {
+    if (!mission) {
+      Config.create(newConfig)
+        .then((created) => {
+          if (req.body.makedir === "true") {
+            let dir = "./Missions/" + created.mission;
+            if (!fs.existsSync(dir)) {
+              fs.mkdirSync(dir);
+              let dir2 = dir + "/Layers";
+              if (!fs.existsSync(dir2)) {
+                fs.mkdirSync(dir2);
+              }
+              let dir3 = dir + "/Data";
+              if (!fs.existsSync(dir3)) {
+                fs.mkdirSync(dir3);
               }
             }
+          }
 
-            logger(
-              "info",
-              "Successfully created mission: " + created.mission,
-              req.originalUrl,
-              req
-            );
-            if (cb)
-              cb({
-                status: "success",
-                mission: created.mission,
-                version: created.version,
-              });
-            else
-              res.send({
-                status: "success",
-                mission: created.mission,
-                version: created.version,
-              });
-            return null;
-          })
-          .catch((err) => {
-            logger(
-              "error",
-              "Failed to create new mission.",
-              req.originalUrl,
-              req,
-              err
-            );
-            if (cb)
-              cb({
-                status: "failure",
-                message: "Failed to create new mission.",
-              });
-            else
-              res.send({
-                status: "failure",
-                message: "Failed to create new mission.",
-              });
-            return null;
-          });
-      } else {
-        logger("error", "Mission already exists.", req.originalUrl, req);
-        if (cb) cb({ status: "failure", message: "Mission already exists." });
-        else
-          res.send({ status: "failure", message: "Mission already exists." });
-      }
-      return null;
-    })
-    .catch((err) => {
-      logger(
-        "error",
-        "Failed to check if mission already exists.",
-        req.originalUrl,
-        req,
-        err
-      );
-      if (cb)
-        cb({
-          status: "failure",
-          message: "Failed to check if mission already exists.",
+          logger(
+            "info",
+            "Successfully created mission: " + created.mission,
+            req.originalUrl,
+            req
+          );
+          if (cb)
+            cb({
+              status: "success",
+              mission: created.mission,
+              version: created.version,
+            });
+          else
+            res.send({
+              status: "success",
+              mission: created.mission,
+              version: created.version,
+            });
+          return null;
+        })
+        .catch((err) => {
+          logger(
+            "error",
+            "Failed to create new mission.",
+            req.originalUrl,
+            req,
+            err
+          );
+          if (cb)
+            cb({
+              status: "failure",
+              message: "Failed to create new mission.",
+            });
+          else
+            res.send({
+              status: "failure",
+              message: "Failed to create new mission.",
+            });
+          return null;
         });
+    } else {
+      logger("error", "Mission already exists.", req.originalUrl, req);
+      if (cb) cb({ status: "failure", message: "Mission already exists." });
       else
-        res.send({
-          status: "failure",
-          message: "Failed to check if mission already exists.",
-        });
-      return null;
-    });
+        res.send({ status: "failure", message: "Mission already exists." });
+    }
+    return null;
+  })
+  .catch((err) => {
+    logger(
+      "error",
+      "Failed to check if mission already exists.",
+      req.originalUrl,
+      req,
+      err
+    );
+    if (cb)
+      cb({
+        status: "failure",
+        message: "Failed to check if mission already exists.",
+      });
+    else
+      res.send({
+        status: "failure",
+        message: "Failed to check if mission already exists.",
+      });
+    return null;
+  });
   return null;
 }
 
@@ -576,6 +603,16 @@ if (fullAccess) router.post("/rename", function (req, res, next) {});
 
 if (fullAccess)
   router.post("/destroy", function (req, res, next) {
+    // Validate mission name for filesystem safety
+    if (!isValidMissionName(req.body.mission)) {
+      logger("error", "Attempted to destroy bad mission name (filesystem unsafe).", req.originalUrl, req);
+      res.send({
+        status: "failure",
+        message: "Bad mission name. Mission name must only contain letters, numbers, underscores, or hyphens, and must not contain path traversal or slashes.",
+      });
+      return null;
+    }
+
     Config.destroy({
       where: {
         mission: req.body.mission,
@@ -728,7 +765,11 @@ function addLayer(req, res, next, cb, forceConfig, caller = "addLayer") {
     (config) => {
       config = forceConfig || config;
       if (config.status === "failure") {
-        res.send(config);
+        // Only send a minimal, safe error response
+        res.send({
+          status: "failure",
+          message: config && config.message ? config.message : "Failed to retrieve config."
+        });
       } else {
         try {
           let placementPath = req.body.placement?.path;

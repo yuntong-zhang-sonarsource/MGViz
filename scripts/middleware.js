@@ -135,7 +135,7 @@ async function sendImage(req, res, next, relUrlSplit) {
 }
 
 const middleware = {
-  missions: function () {
+missions: function () {
     return (req, res, next) => {
       const originalUrl = req.originalUrl.split("?")[0];
       const relUrl = req.url.split("?")[0];
@@ -155,8 +155,18 @@ const middleware = {
           Date.now() - dirStore[relUrlSplit[0]].lastUpdated >
           DIR_STORE_MAX_AGE
         ) {
+          // Sanitize the user input to prevent directory traversal
+          const requestedDir = path.join(rootDir, urlSplit[0]);
+          const resolvedDir = path.resolve(requestedDir);
+
+          // Ensure the resolved path is within rootDir
+          if (!resolvedDir.startsWith(path.resolve(rootDir))) {
+            res.sendStatus(404);
+            return;
+          }
+
           fs.readdir(
-            path.join(rootDir, urlSplit[0]),
+            resolvedDir,
             { withFileTypes: true },
             (error, files) => {
               if (!error) {

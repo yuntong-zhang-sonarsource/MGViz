@@ -11,6 +11,21 @@ const User = require("../../Users/models/user");
 const router = express.Router();
 const db = database.db;
 
+// Utility function to validate table and column names (alphanumeric and underscores only)
+function isValidIdentifier(str) {
+  return typeof str === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(str);
+}
+
+// Utility function to validate bbox string (should be 4 comma-separated floats)
+function parseAndValidateBbox(bbox) {
+  if (typeof bbox !== "string") return null;
+  const parts = bbox.split(",");
+  if (parts.length !== 4) return null;
+  const floats = parts.map(Number);
+  if (floats.some(isNaN)) return null;
+  return floats;
+}
+
 /**
  * A get call to the API to get all the records from waypoints table
  * as a GeoJSON format.
@@ -23,18 +38,18 @@ const db = database.db;
  */
 router.get("/layer=:layer_name", function(req, res, next) {
   let layerName = req.params.layer_name;
+  // Validate layerName to prevent SQL injection
+  if (!isValidIdentifier(layerName)) {
+    return res.status(400).send({ error: "Invalid layer name." });
+  }
   let query_1 =
     "SELECT 'SELECT ' || array_to_string(ARRAY(" +
-    "SELECT 'S' || '.' || c.column_name FROM information_schema.columns As c WHERE table_name = '" +
-    layerName +
-    "' AND  c.column_name NOT IN('geom') ), ',') || ' FROM " +
-    layerName +
-    " As S' As sqlstmt;";
-
-  db.any(query_1)
+    "SELECT 'S' || '.' || c.column_name FROM information_schema.columns As c WHERE table_name = $1 AND  c.column_name NOT IN('geom') ), ',') || ' FROM ' || $1 || ' As S' As sqlstmt;";
+  db.any(query_1, [layerName])
     .then(function(d1) {
       // Check the result
       let queryTOexecute = d1[0].sqlstmt;
+      // Only allow the generated query to reference the validated layerName
       let query_2 =
         " SELECT 'FeatureCollection' As type, array_to_json(array_agg(f))" +
         " As features FROM ( SELECT 'Feature' As type, ST_AsGeoJSON(sec1.geom)::json As geometry, " +
@@ -43,8 +58,6 @@ router.get("/layer=:layer_name", function(req, res, next) {
         " AS sec1 INNER JOIN (" +
         queryTOexecute +
         ") AS sec2 ON sec1.id = sec2.id) As f;";
-
-      // console.log("Second Query: ", query_2)
 
       db.any(query_2)
         .then(function(d2) {
@@ -205,19 +218,20 @@ router.get("/uid=:user_id/tkn=:token/bbox=:bbox", checkAuthentication, function(
   next
 ) {
   let bbox = req.params.bbox;
-
+  const bboxArr = parseAndValidateBbox(bbox);
+  if (!bboxArr) {
+    return res.status(400).send({ error: "Invalid bbox parameter." });
+  }
+  // Use parameterized query for bbox values
   let query =
     "SELECT row_to_json(fc) FROM (SELECT 'FeatureCollection' As type, " +
     "array_to_json(array_agg(f)) As features FROM ( SELECT 'Feature' As type, " +
     "ST_AsGeoJSON(tar1.geom)::json As geometry, row_to_json(tar2) As properties " +
     'FROM public."targets" As tar1 INNER JOIN ( ' +
     'SELECT "targets".target_plan, "targets".sol, "targets".rmc, "targets".image_id ' +
-    'FROM public."targets" WHERE "targets".geom && ST_MakeEnvelope(' +
-    bbox +
-    ",4326)) As tar2 ON tar1.target_plan = tar2.target_plan ) As f)  As fc;";
+    'FROM public."targets" WHERE "targets".geom && ST_MakeEnvelope($1, $2, $3, $4, 4326)) As tar2 ON tar1.target_plan = tar2.target_plan ) As f)  As fc;';
 
-  // Get the data from database
-  db.any(query)
+  db.any(query, bboxArr)
     .then(function(data) {
       res.send(data[0].row_to_json);
     })
@@ -274,69 +288,74 @@ router.get(
       Amount: req.params.amount
     };
 
+    // Validate instrument and material
+    let validInstrument = ["ccam", "apxs"].includes(requestedItems.Instrument);
+    let validMaterial = false;
+    if (requestedItems.Instrument === "ccam") {
+      validMaterial = chemcam_materials.includes(requestedItems.Material);
+    } else if (requestedItems.Instrument === "apxs") {
+      validMaterial = apxs_materials.includes(requestedItems.Material);
+    }
+    if (!validInstrument || !validMaterial) {
+      return res.status(400).send({
+        error: "Invalid instrument or material."
+      });
+    }
+    // Validate amount is a number
+    let amountNum = parseFloat(requestedItems.Amount);
+    if (isNaN(amountNum)) {
+      return res.status(400).send({ error: "Invalid amount." });
+    }
+    // Validate operand
+    let operand = requestedItems.Operand;
+    if (!["<=", ">="].includes(operand)) {
+      return res.status(400).send({ error: "Invalid operand." });
+    }
+    // Validate bbox
+    const bboxArr = parseAndValidateBbox(requestedItems.BoundingBox);
+    if (!bboxArr) {
+      return res.status(400).send({ error: "Invalid bbox parameter." });
+    }
+
     let query = "";
+    let params = [];
 
     switch (requestedItems.Instrument) {
       case "ccam":
-        if (!chemcam_materials.includes(requestedItems.Material)) {
-          res.send({
-            Material: requestedItems.Material,
-            Message: "Error: The material is not avalable in our records!"
-          });
-        } else {
-          query =
-            "SELECT row_to_json(fc) FROM " +
-            "( SELECT 'FeatureCollection' As type, array_to_json(array_agg(f)) As features" +
-            " FROM ( SELECT 'Feature' As type, ST_AsGeoJSON(tar1.geom)::json As geometry, row_to_json(tar2) As properties" +
-            " FROM targets As tar1 INNER JOIN (SELECT tar.target_plan, tar.sol, tar.rmc, tar.image_id, chc." +
-            requestedItems.Material +
-            " FROM targets AS tar, data_" +
-            requestedItems.Instrument +
-            " AS chc WHERE tar.target_plan = chc.target_plan AND " +
-            requestedItems.Material +
-            " " +
-            requestedItems.Operand +
-            " " +
-            requestedItems.Amount +
-            " GROUP BY tar.target_plan, chc." +
-            requestedItems.Material +
-            ") As tar2 ON tar1.target_plan = tar2.target_plan ) As f)  As fc;";
-        }
+        query =
+          "SELECT row_to_json(fc) FROM " +
+          "( SELECT 'FeatureCollection' As type, array_to_json(array_agg(f)) As features" +
+          " FROM ( SELECT 'Feature' As type, ST_AsGeoJSON(tar1.geom)::json As geometry, row_to_json(tar2) As properties" +
+          " FROM targets As tar1 INNER JOIN (SELECT tar.target_plan, tar.sol, tar.rmc, tar.image_id, chc." +
+          requestedItems.Material +
+          " FROM targets AS tar, data_ccam AS chc WHERE tar.target_plan = chc.target_plan AND " +
+          "chc." + requestedItems.Material + " " + operand + " $1" +
+          " GROUP BY tar.target_plan, chc." +
+          requestedItems.Material +
+          ") As tar2 ON tar1.target_plan = tar2.target_plan ) As f)  As fc;";
+        params = [amountNum];
         break;
       case "apxs":
-        if (!apxs_materials.includes(requestedItems.Material)) {
-          res.send({
-            Material: requestedItems.Material,
-            Message: "Error: The material is not avalable in our records!"
-          });
-        } else {
-          query =
-            "SELECT row_to_json(fc) FROM " +
-            "( SELECT 'FeatureCollection' As type, array_to_json(array_agg(f)) As features" +
-            " FROM ( SELECT 'Feature' As type, ST_AsGeoJSON(tar1.geom)::json As geometry, row_to_json(tar2) As properties" +
-            " FROM targets As tar1 INNER JOIN (SELECT tar.target_plan, tar.sol, tar.rmc, tar.image_id, chc." +
-            requestedItems.Material +
-            " FROM targets AS tar, data_chemcam AS chc WHERE tar.target_plan = chc.target_plan AND " +
-            requestedItems.Material +
-            " " +
-            requestedItems.Operand +
-            " " +
-            requestedItems.Amount +
-            " GROUP BY tar.target_plan, chc." +
-            requestedItems.Material +
-            ") As tar2 ON tar1.target_plan = tar2.target_plan ) As f)  As fc;";
-        }
+        query =
+          "SELECT row_to_json(fc) FROM " +
+          "( SELECT 'FeatureCollection' As type, array_to_json(array_agg(f)) As features" +
+          " FROM ( SELECT 'Feature' As type, ST_AsGeoJSON(tar1.geom)::json As geometry, row_to_json(tar2) As properties" +
+          " FROM targets As tar1 INNER JOIN (SELECT tar.target_plan, tar.sol, tar.rmc, tar.image_id, chc." +
+          requestedItems.Material +
+          " FROM targets AS tar, data_chemcam AS chc WHERE tar.target_plan = chc.target_plan AND " +
+          "chc." + requestedItems.Material + " " + operand + " $1" +
+          " GROUP BY tar.target_plan, chc." +
+          requestedItems.Material +
+          ") As tar2 ON tar1.target_plan = tar2.target_plan ) As f)  As fc;";
+        params = [amountNum];
         break;
       default:
-        res.send({
-          Instrument: requestedItems.Instrument,
-          Message: "Error: Data is not avalable for this instrument!"
+        return res.status(400).send({
+          error: "Invalid instrument."
         });
     }
-    // Check the query before execution
 
-    // Get the data from database
-    db.any(query)
+    db.any(query, params)
       .then(function(data) {
         res.send(data[0].row_to_json);
       })
@@ -403,9 +422,13 @@ router.get("/inst=:instrument/data_min_avg_max&mat=:material", function(
   let instrument = req.params.instrument;
   let material = req.params.material;
 
+  // Validate instrument and material
+  if (!isValidIdentifier(instrument) || !isValidIdentifier(material)) {
+    return res.status(400).send({ error: "Invalid instrument or material." });
+  }
+
   let query = "SELECT " + material + " FROM data_" + instrument + " ;";
 
-  // Get the data from database
   db.any(query)
     .then(function(d) {
       // Get the data in an array format
@@ -558,10 +581,18 @@ router.post(
     // Get the query string from html
     let loadedQuery = req.body.query;
 
+    // Only allow SELECT queries for safety
+    if (
+      typeof loadedQuery !== "string" ||
+      !loadedQuery.trim().toLowerCase().startsWith("select")
+    ) {
+      return res.status(400).send({ error: "Only SELECT queries are allowed." });
+    }
+
     // Get selected query data from database
     db.any(loadedQuery)
       .then(function(data) {
-        res.send(data[0].row_to_json); // Send back the result as GeoJSON format.
+        res.send(data[0]?.row_to_json || data); // Send back the result as GeoJSON format.
       })
       .catch(function(err) {
         return next(err);
@@ -612,6 +643,26 @@ router.post(
  * @param {*} res
  * @param {*} next
  */
+const { escapeIdentifier } = require('pg-escape'); // You may need to install pg-escape or use your own escape function
+
+// Whitelist of allowed columns for security
+const ALLOWED_COLUMNS = [
+  "target_plan", "column1", "column2", "column3" // <-- Replace with actual allowed column names
+];
+
+// Whitelist of allowed instruments/tables
+const ALLOWED_INSTRUMENTS = [
+  "instrument1", "instrument2", "instrument3" // <-- Replace with actual allowed instrument names
+];
+
+function isAllowedColumn(col) {
+  return ALLOWED_COLUMNS.includes(col);
+}
+
+function isAllowedInstrument(inst) {
+  return ALLOWED_INSTRUMENTS.includes(inst);
+}
+
 async function runFinalQuery(req, res, next) {
   let operation = req.params.operation;
   let queryName = req.params.name;
@@ -624,13 +675,18 @@ async function runFinalQuery(req, res, next) {
   let queryDescription = data.description;
 
   let i;
+  // Validate and escape column names
   for (i = 0; i < params.length - 1; i++) {
-    if (params[i].column_name !== "target_plan") {
-      selectedColumns += "sec_0." + params[i].column_name + ", ";
+    if (params[i].column_name !== "target_plan" && isAllowedColumn(params[i].column_name)) {
+      selectedColumns += `sec_0.${escapeIdentifier(params[i].column_name)}, `;
     }
   }
 
-  selectedColumns += "sec_0." + params[i].column_name;
+  if (isAllowedColumn(params[i].column_name)) {
+    selectedColumns += `sec_0.${escapeIdentifier(params[i].column_name)}`;
+  } else {
+    return res.status(400).send("Invalid column name");
+  }
 
   let baseQuery = "";
   let geomFlag = true;
@@ -640,11 +696,18 @@ async function runFinalQuery(req, res, next) {
   let geometryPartQuery = "";
 
   let instrument, compType, fieldName;
+  let queryParams = [];
+  let paramIdx = 1;
 
   for (i = 0; i < components.length; i++) {
     instrument = components[i].instrument;
     compType = components[i].comp_type;
     fieldName = components[i].item;
+
+    // Validate instrument and fieldName
+    if (!isAllowedInstrument(instrument) || !isAllowedColumn(fieldName)) {
+      return res.status(400).send("Invalid instrument or field name");
+    }
 
     // Check the type of the query component
     if (compType === "N" || compType === "S") {
@@ -657,21 +720,15 @@ async function runFinalQuery(req, res, next) {
       if (compType === "N") {
         // Get the range values
         let inputRange = components[i].input;
-        // Using "WHERE" clause that says "WHERE component.item >= inputRange[0] AND component.item <= inputRange[1]"
+        if (!Array.isArray(inputRange) || inputRange.length !== 2) {
+          return res.status(400).send("Invalid input range");
+        }
+        // Use parameterized values
         numStrPartQuery +=
-          "(" +
-          instrument +
-          "." +
-          fieldName +
-          " >= " +
-          inputRange[0] +
-          " AND " +
-          instrument +
-          "." +
-          fieldName +
-          " <= " +
-          inputRange[1] +
-          ") "; // + component.and_or + " ";
+          `(${escapeIdentifier(instrument)}.${escapeIdentifier(fieldName)} >= $${paramIdx} AND ` +
+          `${escapeIdentifier(instrument)}.${escapeIdentifier(fieldName)} <= $${paramIdx + 1}) `;
+        queryParams.push(inputRange[0], inputRange[1]);
+        paramIdx += 2;
       }
 
       if (compType === "S") {
@@ -681,10 +738,13 @@ async function runFinalQuery(req, res, next) {
 
         // If input is coming from string input but it is actually a number
         if (isnum) {
-          numStrPartQuery += "(" + fieldName + " = '" + valueForField + "') ";
+          numStrPartQuery += `(${escapeIdentifier(fieldName)} = $${paramIdx}) `;
+          queryParams.push(valueForField);
+          paramIdx += 1;
         } else {
-          numStrPartQuery +=
-            "(" + fieldName + " LIKE '%" + valueForField + "%') ";
+          numStrPartQuery += `(${escapeIdentifier(fieldName)} LIKE $${paramIdx}) `;
+          queryParams.push(`%${valueForField}%`);
+          paramIdx += 1;
         }
       }
     }
@@ -754,8 +814,8 @@ async function runFinalQuery(req, res, next) {
     ") AS f) As fc;";
 
   if (operation === "run") {
-    // Execute the query
-    db.any(baseQuery)
+    // Execute the query using parameterized values
+    db.any(baseQuery, queryParams)
       .then(function(d) {
         let data = d[0].row_to_json;
         // Send the data back to the front-end and then save the executed query
@@ -883,10 +943,43 @@ function ST_Buffer(coordinates, bufferType, distance) {
  * @param {*} selectedLayerData
  */
 function ST_Intersect(coordinates, selectedLayerData) {
-  return new Promise(resolve => {
+  // Helper function to validate table names (allow only alphanumeric and underscores)
+  function isValidTableName(name) {
+    return typeof name === "string" && /^[a-zA-Z0-9_]+$/.test(name);
+  }
+
+  // Helper function to validate coordinates array
+  function areValidCoordinates(coords) {
+    if (!Array.isArray(coords) || coords.length < 3) return false;
+    for (let i = 0; i < coords.length; i++) {
+      if (
+        typeof coords[i] !== "object" ||
+        typeof coords[i].lng !== "number" ||
+        typeof coords[i].lat !== "number" ||
+        !isFinite(coords[i].lng) ||
+        !isFinite(coords[i].lat)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return new Promise((resolve, reject) => {
     let layerName = selectedLayerData[0];
     let layerType = selectedLayerData[1];
     let geomAsText = "";
+
+    // Validate table name
+    if (!isValidTableName(layerName)) {
+      return reject(new Error("Invalid layer name."));
+    }
+
+    // Validate coordinates
+    if (!areValidCoordinates(coordinates)) {
+      return reject(new Error("Invalid coordinates."));
+    }
+
     let coords = "";
     let i;
     for (i = 0; i < coordinates.length - 1; i++) {
@@ -895,15 +988,17 @@ function ST_Intersect(coordinates, selectedLayerData) {
     coords += coordinates[i].lng + " " + coordinates[i].lat;
     // Close the ring
     coords += "," + coordinates[0].lng + " " + coordinates[0].lat;
+
+    // Use parameterized query for geometry text, but table name must be injected after validation
     let q =
-      " SELECT ST_AsGeoJSON( l.geom ) FROM " +
+      "SELECT ST_AsGeoJSON(l.geom) FROM " +
       layerName +
-      " AS l WHERE ST_Intersects( ST_GeomFromText('POLYGON((" +
-      coords +
-      "))', 4326) , l.geom ) = true";
+      " AS l WHERE ST_Intersects(ST_GeomFromText($1, 4326), l.geom) = true";
+
+    let polygonText = "POLYGON((" + coords + "))";
 
     // Execute the query
-    db.any(q)
+    db.any(q, [polygonText])
       .then(function(geoms) {
         // Create a polygon that covers all the points extracted from ST_Intersects GIS function
         if (layerType === "Points") {
@@ -999,9 +1094,9 @@ function ST_Intersect(coordinates, selectedLayerData) {
         }
       })
       .catch(function(err) {
-        return next(err);
+        reject(err);
       });
-  }, 2000);
+  });
 }
 
 /**
